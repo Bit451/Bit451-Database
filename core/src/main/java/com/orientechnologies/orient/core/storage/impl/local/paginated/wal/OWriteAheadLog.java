@@ -41,6 +41,7 @@ import java.util.regex.Pattern;
 import java.util.zip.CRC32;
 
 import com.orientechnologies.common.directmemory.ODirectMemoryPointer;
+import com.orientechnologies.common.io.OFileUtils;
 import com.orientechnologies.common.log.OLogManager;
 import com.orientechnologies.common.serialization.types.OIntegerSerializer;
 import com.orientechnologies.common.serialization.types.OLongSerializer;
@@ -285,10 +286,17 @@ public class OWriteAheadLog {
     public void delete(boolean flush) throws IOException {
       close(flush);
 
-      boolean deleted = file.delete();
+      boolean deleted = OFileUtils.delete(file);
+      int retryCount = 0;
+
       while (!deleted) {
         OMemoryWatchDog.freeMemoryForResourceCleanup(100);
-        deleted = !file.exists() || file.delete();
+
+        deleted = OFileUtils.delete(file);
+        retryCount++;
+
+        if (retryCount > 10)
+          throw new IOException("Can not delete file. Retry limit exceeded. (" + retryCount + ").");
       }
     }
 
@@ -617,6 +625,8 @@ public class OWriteAheadLog {
         flushedLsn = null;
       } else {
 
+        logSize = 0;
+
         for (File walFile : walFiles) {
           LogSegment logSegment = new LogSegment(walFile, maxPagesCacheSize);
           logSegment.init();
@@ -784,15 +794,17 @@ public class OWriteAheadLog {
       logSize += sizeDiff;
 
       if (logSize >= maxLogSize) {
-        LogSegment first = logSegments.get(0);
-        first.stopFlush(false);
+        final LogSegment first = removeHeadSegmentFromList();
 
-        logSize -= first.filledUpTo();
+        if (first != null) {
+          first.stopFlush(false);
 
-        first.delete(false);
-        logSegments.remove(0);
+          first.delete(false);
 
-        fixMasterRecords();
+          recalculateLogSize();
+
+          fixMasterRecords();
+        }
       }
 
       if (last.filledUpTo() >= maxSegmentSize) {
@@ -807,6 +819,13 @@ public class OWriteAheadLog {
 
       return lsn;
     }
+  }
+
+  private void recalculateLogSize() throws IOException {
+    logSize = 0;
+
+    for (LogSegment segment : logSegments)
+      logSize += segment.filledUpTo();
   }
 
   public long size() {
@@ -826,6 +845,8 @@ public class OWriteAheadLog {
         logSegment.delete(false);
         iterator.remove();
       }
+
+      recalculateLogSize();
     }
   }
 
@@ -935,11 +956,7 @@ public class OWriteAheadLog {
   }
 
   public OLogSequenceNumber getFlushedLSN() {
-    synchronized (syncObject) {
-      checkForClose();
-
-      return flushedLsn;
-    }
+    return flushedLsn;
   }
 
   public OLogSequenceNumber logFullCheckpointStart() throws IOException {
@@ -972,10 +989,20 @@ public class OWriteAheadLog {
       }
 
       for (int i = 0; i <= lastTruncateIndex; i++) {
-        final LogSegment logSegment = logSegments.remove(0);
-        logSegment.delete(false);
+        final LogSegment logSegment = removeHeadSegmentFromList();
+        if (logSegment != null)
+          logSegment.delete(false);
       }
+
+      recalculateLogSize();
     }
+  }
+
+  private LogSegment removeHeadSegmentFromList() {
+    if (logSegments.size() < 2)
+      return null;
+
+    return logSegments.remove(0);
   }
 
   private void fixMasterRecords() throws IOException {
